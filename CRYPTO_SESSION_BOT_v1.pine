@@ -1,0 +1,386 @@
+// (c) ACKRITE619
+// CRYPTO SESSION BOT v1 -- ForexBot ICC logic ported to Alpaca crypto execution
+// Pairs: BTCUSD, ETHUSD (Coinbase or OANDA feed)
+// Strategy: London + NY session breakouts with Asian range reference + ICC confirmation
+// Routes to: Alpaca (crypto paper/live)
+
+//@version=6
+strategy("CRYPTO SESSION BOT v1", shorttitle="CRYPTO SESSION v1",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.percent,
+     commission_value=0.1,
+     slippage=2,
+     calc_on_every_tick=false,
+     max_bars_back=500,
+     max_labels_count=500,
+     max_boxes_count=500)
+
+// ============================================================
+// GROUPS
+// ============================================================
+grpBT      = "Backtest"
+grpQ       = "Settings"
+grpSession = "Session"
+grpICC     = "ICC Engine"
+grpPDHL    = "PDH/PDL Filter"
+grpDisplay = "Display"
+
+// ============================================================
+// BACKTEST
+// ============================================================
+btStart   = input.time(timestamp("2024-01-01"), "Start", group=grpBT)
+btEnd     = input.time(timestamp("2099-12-31"), "End",   group=grpBT)
+filterLong  = input.bool(true,  "Trade Longs",  group=grpBT)
+filterShort = input.bool(true,  "Trade Shorts", group=grpBT)
+usePartials = input.bool(true,  "50% at TP1",   group=grpBT)
+showBoxes   = input.bool(true,  "Show Boxes",   group=grpBT)
+relaxedBT   = input.bool(false, "Relaxed Backtest Mode (removes session/daily gates)", group=grpBT)
+inBacktest  = time >= btStart and time <= btEnd
+
+// ============================================================
+// SETTINGS
+// ============================================================
+chartTZ      = input.string("CT", "Timezone", options=["ET","CT","MT","PT","UTC"], group=grpQ)
+riskPct      = input.float(1.0,  "Risk %",    minval=0.1, maxval=5.0, step=0.1, group=grpQ)
+rrRatio      = input.float(2.0,  "R:R Ratio", minval=1.0, maxval=5.0, step=0.5, group=grpQ)
+webhookSecret = input.string("YOUR_SECRET_HERE", "Webhook Secret", group=grpQ)
+
+tzOffset =
+     chartTZ=="ET"?0:chartTZ=="CT"?-1:chartTZ=="MT"?-2:
+     chartTZ=="PT"?-3:chartTZ=="UTC"?5:0
+
+// ============================================================
+// SESSION HOURS (crypto-adjusted -- sessions matter for liquidity)
+// ============================================================
+useLondon    = input.bool(true,  "London Session", group=grpSession)
+useNY        = input.bool(true,  "NY Session",     group=grpSession)
+requireAsian = input.bool(false, "Require Asian Range Break", group=grpSession)
+minRangePct  = input.float(0.3,  "Min Asian Range %", minval=0.1, maxval=2.0, step=0.1, group=grpSession)
+maxRangePct  = input.float(3.0,  "Max Asian Range %", minval=0.5, maxval=10.0, step=0.5, group=grpSession)
+
+lonStartH = (3  + tzOffset) % 24
+lonEndH   = (9  + tzOffset) % 24
+nyStartH  = (9  + tzOffset) % 24
+nyEndH    = (17 + tzOffset) % 24
+asiaEndH  = lonStartH
+
+asiaSession   = hour < asiaEndH or hour >= (20 + tzOffset) % 24
+londonSession = hour >= lonStartH and hour < lonEndH
+nySession     = (hour == nyStartH and minute >= 30) or (hour > nyStartH and hour < nyEndH)
+sessName      = nySession ? "NY" : londonSession ? "LONDON" : asiaSession ? "ASIA" : "OFF"
+
+// ============================================================
+// ASIAN RANGE TRACKING
+// ============================================================
+var float asiaHigh  = na
+var float asiaLow   = na
+var bool  asiaValid = false
+
+if ta.change(time("D")) != 0
+    asiaHigh  := na
+    asiaLow   := na
+    asiaValid := false
+
+if asiaSession
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow  := na(asiaLow)  ? low  : math.min(asiaLow,  low)
+
+// Validate Asian range at London open -- use % for crypto instead of pips
+if londonSession and not londonSession[1] and not na(asiaHigh) and not na(asiaLow)
+    rangePct = (asiaHigh - asiaLow) / asiaLow * 100
+    asiaValid := rangePct >= minRangePct and rangePct <= maxRangePct
+
+var bool asianSwept = false
+if ta.change(time("D")) != 0
+    asianSwept := false
+if not asiaSession and not na(asiaHigh) and not na(asiaLow)
+    if high > asiaHigh or low < asiaLow
+        asianSwept := true
+
+asiaGateL = relaxedBT or not requireAsian or (asiaValid and not na(asiaHigh) and close > asiaHigh)
+asiaGateS = relaxedBT or not requireAsian or (asiaValid and not na(asiaLow)  and close < asiaLow)
+
+// London high/low tracking for NY session reference
+var float lonHigh = na
+var float lonLow  = na
+var bool  lonSet  = false
+
+if ta.change(time("D")) != 0
+    lonHigh := na
+    lonLow  := na
+    lonSet  := false
+
+if londonSession
+    lonHigh := na(lonHigh) ? high : math.max(lonHigh, high)
+    lonLow  := na(lonLow)  ? low  : math.min(lonLow,  low)
+    lonSet  := true
+
+// ============================================================
+// HTF BIAS (1H only for crypto -- 4H often too slow)
+// ============================================================
+[htf1hClose, htf1hOpen, htf1hVWAP, htf1hEMA20, htf1hEMA50] = request.security(
+     syminfo.tickerid, "60",
+     [close, open, ta.vwap(hlc3), ta.ema(close,20), ta.ema(close,50)],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+[htf4hClose, htf4hOpen, htf4hEMA20, htf4hEMA50] = request.security(
+     syminfo.tickerid, "240",
+     [close, open, ta.ema(close,20), ta.ema(close,50)],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+htf1hBull = htf1hClose > htf1hVWAP and htf1hClose > htf1hOpen and htf1hEMA20 > htf1hEMA50
+htf1hBear = htf1hClose < htf1hVWAP and htf1hClose < htf1hOpen and htf1hEMA20 < htf1hEMA50
+htf4hBull = htf4hClose > htf4hOpen and htf4hEMA20 > htf4hEMA50
+htf4hBear = htf4hClose < htf4hOpen and htf4hEMA20 < htf4hEMA50
+
+dualHTFBull = htf1hBull and htf4hBull
+dualHTFBear = htf1hBear and htf4hBear
+
+// ============================================================
+// ICC ENGINE (ported from ForexBot)
+// ============================================================
+iccLen1    = input.int(5,  "ICC Fast",  minval=2, maxval=20, group=grpICC)
+iccLen2    = input.int(8,  "ICC Slow",  minval=4, maxval=40, group=grpICC)
+iccConfirm = input.int(5,  "ICC 1H Close Confirm", minval=1, maxval=20, group=grpICC)
+iccMinQ    = input.int(0,  "Min ICC Quality (0=off)", minval=0, maxval=100, group=grpICC)
+useICC     = input.bool(true, "Require ICC Correction", group=grpICC)
+
+[i1hClose15, i1hHigh15, i1hLow15] = request.security(
+     syminfo.tickerid, "60",
+     [close[1], high[1], low[1]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+iccFastL = ta.ema(close, iccLen1)
+iccSlowL = ta.ema(close, iccLen2)
+iccTrend = iccFastL > iccSlowL ? 1 : -1
+
+var int   iccCorrBarsL = 0
+var int   iccCorrBarsS = 0
+var float iccFrzLL     = na
+var float iccFrzHS     = na
+
+if iccTrend == 1
+    if close < iccFastL
+        iccCorrBarsL += 1
+        iccFrzLL := na(iccFrzLL) ? low : math.min(iccFrzLL, low)
+    else
+        iccCorrBarsL := 0
+        iccFrzLL := na
+
+if iccTrend == -1
+    if close > iccFastL
+        iccCorrBarsS += 1
+        iccFrzHS := na(iccFrzHS) ? high : math.max(iccFrzHS, high)
+    else
+        iccCorrBarsS := 0
+        iccFrzHS := na
+
+icc_inCorrL = iccCorrBarsL >= 1 and iccCorrBarsL <= 8
+icc_inCorrS = iccCorrBarsS >= 1 and iccCorrBarsS <= 8
+
+// 1H confirmation
+i15contL = iccConfirm == 0 or (i1hClose15 > i1hLow15 and i1hClose15 > iccFastL)
+i15contS = iccConfirm == 0 or (i1hClose15 < i1hHigh15 and i1hClose15 < iccFastL)
+
+iccQScore = icc_inCorrL or icc_inCorrS ? math.min(100, (iccCorrBarsL + iccCorrBarsS) * 15) : 0
+iccQPass  = relaxedBT or iccMinQ == 0 or iccQScore >= iccMinQ
+
+iccGateLong  = relaxedBT or not useICC or (icc_inCorrL and i15contL and iccQPass)
+iccGateShort = relaxedBT or not useICC or (icc_inCorrS and i15contS and iccQPass)
+
+// ============================================================
+// TECHNICAL FILTERS
+// ============================================================
+atrVal   = ta.atr(14)
+atrBuf   = atrVal * 0.1
+rsiVal   = ta.rsi(close, 14)
+adxLen   = 14
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+avgBody  = ta.sma(math.abs(close - open), 20)
+bodySize = math.abs(close - open)
+volSMA   = ta.sma(volume, 20)
+aboveVol = volume > volSMA * 1.1
+
+// ============================================================
+// M15 STRUCTURAL CONFIRMATION (HTF=4H/1H -> LTF=M15 -> Entry)
+// Per the drill-down framework: 4H sets bias, 1H confirms ICC,
+// M15 must confirm structure before entry fires on the chart bar.
+// ============================================================
+useM15Confirm = input.bool(true, "Require M15 Structure Confirmation", group=grpICC,
+     tooltip="ON: M15 must show bullish/bearish structure (close > EMA + momentum) before entry. Adds one more drill-down layer per the HTF->LTF framework.")
+
+[m15Close, m15Open, m15High, m15Low, m15Vol] = request.security(
+     syminfo.tickerid, "15",
+     [close, open, high, low, volume],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+m15EMA20 = request.security(syminfo.tickerid, "15", ta.ema(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+m15EMA50 = request.security(syminfo.tickerid, "15", ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+m15RSI   = request.security(syminfo.tickerid, "15", ta.rsi(close, 14), barmerge.gaps_off, barmerge.lookahead_off)
+[m15DIPlus, m15DIMinus, m15ADX] = request.security(syminfo.tickerid, "15", ta.dmi(14, 14), barmerge.gaps_off, barmerge.lookahead_off)
+m15Body  = math.abs(m15Close - m15Open)
+m15AvgBody = request.security(syminfo.tickerid, "15", ta.sma(math.abs(close - open), 20), barmerge.gaps_off, barmerge.lookahead_off)
+
+// M15 bullish structure: price above both EMAs, EMA20 > EMA50, RSI not overbought, momentum candle
+m15Bull =
+     m15Close > m15EMA20   and
+     m15Close > m15EMA50   and
+     m15EMA20 > m15EMA50   and
+     m15RSI   > 40          and
+     m15RSI   < 75          and
+     m15ADX   > 15          and
+     m15Close > m15Open     and
+     m15Body  > m15AvgBody * 0.3
+
+// M15 bearish structure: price below both EMAs, EMA20 < EMA50, RSI not oversold, momentum candle
+m15Bear =
+     m15Close < m15EMA20   and
+     m15Close < m15EMA50   and
+     m15EMA20 < m15EMA50   and
+     m15RSI   < 60          and
+     m15RSI   > 25          and
+     m15ADX   > 15          and
+     m15Close < m15Open     and
+     m15Body  > m15AvgBody * 0.3
+
+m15GateLong  = relaxedBT or not useM15Confirm or m15Bull
+m15GateShort = relaxedBT or not useM15Confirm or m15Bear
+
+// HTF gates
+htfGateL = dualHTFBull
+htfGateS = dualHTFBear
+
+// Fake break detection
+fakeBreakUp = high > ta.highest(high[1], 3) and close < open
+fakeBreakDn = low  < ta.lowest(low[1],  3) and close > open
+
+// PDH/PDL
+usePDHL = input.bool(false, "Enable PDH/PDL Chop Filter", group=grpPDHL,
+     tooltip="OFF by default for crypto -- 24/7 markets make yesterday's range less meaningful")
+pdHigh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+pdLow  = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+insidePDHL   = not na(pdHigh) and not na(pdLow) and close <= pdHigh and close >= pdLow
+pdhlChopGate = not usePDHL or not insidePDHL
+
+// Daily trade gate
+var bool tookTradeToday = false
+var int  dailySigs = 0
+maxDaily = input.int(2, "Max Trades/Day", minval=1, maxval=5, group=grpQ)
+var bool dailyCap = false
+if ta.change(time("D")) != 0
+    tookTradeToday := false
+    dailySigs      := 0
+    dailyCap       := false
+
+var bool coolActive = false
+cooldownBars = input.int(10, "Cooldown (bars)", minval=0, maxval=100, group=grpQ)
+var int barsSinceTrade = 999
+barsSinceTrade := barsSinceTrade + 1
+coolActive := barsSinceTrade < cooldownBars
+
+sigAllowed = relaxedBT or (not coolActive and not dailyCap)
+
+// ============================================================
+// ENTRY CONDITIONS
+// ============================================================
+lonBullBreak = (relaxedBT or useLondon) and (relaxedBT or londonSession) and asiaGateL and dualHTFBull and htfGateL and iccGateLong  and m15GateLong  and not fakeBreakUp and bodySize > avgBody * 0.3 and rsiVal > 40 and rsiVal < 80 and adxVal > 12 and (relaxedBT or not tookTradeToday) and sigAllowed and pdhlChopGate
+lonBearBreak = (relaxedBT or useLondon) and (relaxedBT or londonSession) and asiaGateS and dualHTFBear and htfGateS and iccGateShort and m15GateShort and not fakeBreakDn and bodySize > avgBody * 0.3 and rsiVal < 60 and rsiVal > 20 and adxVal > 12 and (relaxedBT or not tookTradeToday) and sigAllowed and pdhlChopGate
+nyBullBreak  = (relaxedBT or useNY) and (relaxedBT or nySession) and dualHTFBull and htfGateL and iccGateLong  and m15GateLong  and not fakeBreakUp and bodySize > avgBody * 0.3 and rsiVal > 40 and rsiVal < 80 and adxVal > 12 and (relaxedBT or not tookTradeToday) and sigAllowed and (not lonSet or close > lonHigh) and pdhlChopGate
+nyBearBreak  = (relaxedBT or useNY) and (relaxedBT or nySession) and dualHTFBear and htfGateS and iccGateShort and m15GateShort and not fakeBreakDn and bodySize > avgBody * 0.3 and rsiVal < 60 and rsiVal > 20 and adxVal > 12 and (relaxedBT or not tookTradeToday) and sigAllowed and (not lonSet or close < lonLow) and pdhlChopGate
+
+anyLong  = filterLong  and (lonBullBreak or nyBullBreak)
+anyShort = filterShort and (lonBearBreak or nyBearBreak)
+
+// ============================================================
+// SL / TP
+// ============================================================
+slLong  = not na(asiaLow)  and asiaValid ? asiaLow  - atrBuf : close - atrVal * 2.0
+slShort = not na(asiaHigh) and asiaValid ? asiaHigh + atrBuf : close + atrVal * 2.0
+
+slDistL = math.max(close - slLong,  atrVal * 0.5)
+slDistS = math.max(slShort - close, atrVal * 0.5)
+
+tp1L = close + slDistL * 1.0
+tp2L = close + slDistL * rrRatio
+tp1S = close - slDistS * 1.0
+tp2S = close - slDistS * rrRatio
+
+sigType = "SESSION"
+
+// ============================================================
+// STRATEGY ENTRIES
+// ============================================================
+if inBacktest and anyLong and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=1, comment="LONG")
+    if usePartials
+        strategy.exit("Long TP1", "Long", qty_percent=50, limit=tp1L, comment="TP1")
+    strategy.exit("Long Exit", "Long", stop=slLong, limit=tp2L, comment="TP2/SL")
+    tookTradeToday := true
+    dailySigs      += 1
+    barsSinceTrade := 0
+    if dailySigs >= maxDaily
+        dailyCap := true
+
+if inBacktest and anyShort and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=1, comment="SHORT")
+    if usePartials
+        strategy.exit("Short TP1", "Short", qty_percent=50, limit=tp1S, comment="TP1")
+    strategy.exit("Short Exit", "Short", stop=slShort, limit=tp2S, comment="TP2/SL")
+    tookTradeToday := true
+    dailySigs      += 1
+    barsSinceTrade := 0
+    if dailySigs >= maxDaily
+        dailyCap := true
+
+// ============================================================
+// ALERTS
+// ============================================================
+jLong  = '{"action":"LONG","type":"SESSION_LONG","session":"'   + sessName + '","instrument":"' + syminfo.ticker + '","entry":' + str.tostring(close) + ',"sl":' + str.tostring(slLong)  + ',"tp1":' + str.tostring(tp1L) + ',"tp2":' + str.tostring(tp2L) + ',"risk_pct":' + str.tostring(riskPct) + ',"secret":"' + webhookSecret + '"}'
+jShort = '{"action":"SHORT","type":"SESSION_SHORT","session":"' + sessName + '","instrument":"' + syminfo.ticker + '","entry":' + str.tostring(close) + ',"sl":' + str.tostring(slShort) + ',"tp1":' + str.tostring(tp1S) + ',"tp2":' + str.tostring(tp2S) + ',"risk_pct":' + str.tostring(riskPct) + ',"secret":"' + webhookSecret + '"}'
+
+if anyLong
+    alert(jLong,  alert.freq_once_per_bar_close)
+if anyShort
+    alert(jShort, alert.freq_once_per_bar_close)
+
+// TP1 hit detection
+var float activeTp1Long  = na
+var float activeTp1Short = na
+var bool  tp1LongArmed   = false
+var bool  tp1ShortArmed  = false
+
+if anyLong
+    activeTp1Long  := tp1L
+    tp1LongArmed   := true
+    tp1ShortArmed  := false
+    activeTp1Short := na
+if anyShort
+    activeTp1Short := tp1S
+    tp1ShortArmed  := true
+    tp1LongArmed   := false
+    activeTp1Long  := na
+if strategy.position_size == 0
+    tp1LongArmed  := false
+    tp1ShortArmed := false
+
+jTP1 = '{"action":"TP1","instrument":"' + syminfo.ticker + '","secret":"' + webhookSecret + '"}'
+if tp1LongArmed and not na(activeTp1Long) and high >= activeTp1Long
+    alert(jTP1, alert.freq_once_per_bar)
+    tp1LongArmed := false
+if tp1ShortArmed and not na(activeTp1Short) and low <= activeTp1Short
+    alert(jTP1, alert.freq_once_per_bar)
+    tp1ShortArmed := false
+
+// ============================================================
+// VISUALS
+// ============================================================
+bgcolor(londonSession ? color.new(color.blue,   95) : nySession ? color.new(color.green, 95) : na)
+
+plotshape(anyLong,  style=shape.triangleup,   location=location.belowbar, color=color.lime,  size=size.small, title="Long Signal")
+plotshape(anyShort, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, title="Short Signal")
+
+plot(not na(asiaHigh) ? asiaHigh : na, "Asia High", color=color.orange, linewidth=1, style=plot.style_stepline)
+plot(not na(asiaLow)  ? asiaLow  : na, "Asia Low",  color=color.orange, linewidth=1, style=plot.style_stepline)
